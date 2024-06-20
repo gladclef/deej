@@ -1,7 +1,10 @@
 package deej
 
 import (
+	"errors"
 	"fmt"
+	"net"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -56,6 +59,9 @@ const (
 
 // this matches friendly device names (on Windows), e.g. "Headphones (Realtek Audio)"
 var deviceSessionKeyPattern = regexp.MustCompile(`^.+ \(.+\)$`)
+
+var conn = map[string]net.Conn{}
+var conn_err = map[string]error{}
 
 func newSessionMap(deej *Deej, logger *zap.SugaredLogger, sessionFinder SessionFinder) (*sessionMap, error) {
 	logger = logger.Named("sessions")
@@ -219,6 +225,7 @@ func (m *sessionMap) handleSliderMoveEvent(event SliderMoveEvent) {
 
 	// if slider not found in config, silently ignore
 	if !ok {
+		m.logger.Info(fmt.Sprint("Slider not found: ", event.SliderID))
 		return
 	}
 
@@ -261,7 +268,47 @@ func (m *sessionMap) handleSliderMoveEvent(event SliderMoveEvent) {
 	// processes could've opened since the last time this slider moved.
 	// if they haven't, the cooldown will take care to not spam it up
 	if !targetFound {
-		m.refreshSessions(false)
+		if strings.HasPrefix(targets[0], "UDP::") {
+			conn_err_val, ok := conn_err[targets[0]]
+			if !ok || conn_err_val != nil {
+				var addr = strings.Split(targets[0], "UDP::")[1]
+				conn[targets[0]], conn_err[targets[0]] = net.Dial("udp", addr)
+				if conn_err[targets[0]] != nil {
+					fmt.Printf("Error connecting to server: %v", conn_err)
+					return
+				}
+			}
+			if conn_err[targets[0]] == nil {
+				m.logger.Info(fmt.Sprint("Writing value to ", targets[0], ": ", event.PercentValue))
+				_, conn_err[targets[0]] = fmt.Fprintf(conn[targets[0]], "%f", event.PercentValue)
+			}
+		} else if _, err := os.Stat(targets[0]); errors.Is(err, os.ErrNotExist) {
+			m.refreshSessions(false)
+		} else {
+			file := fmt.Sprint(targets[0], "\\external_target.volume_value")
+			m.logger.Info(fmt.Sprint("Writing value to file: ", file))
+			f, err := os.OpenFile(file, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0755)
+			if err != nil {
+				fmt.Println(err)
+				return
+			}
+
+			err = f.Truncate(0)
+			if err != nil {
+				fmt.Println(err)
+				return
+			}
+			_, err = f.Seek(0, 0)
+			if err != nil {
+				fmt.Println(err)
+				return
+			}
+			_, err = f.WriteString(fmt.Sprint(event.PercentValue))
+			if err != nil {
+				fmt.Println(err)
+			}
+			f.Close()
+		}
 	} else if adjustmentFailed {
 
 		// performance: the reason that forcing a refresh here is okay is that we'll only get here

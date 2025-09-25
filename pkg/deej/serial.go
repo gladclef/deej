@@ -16,6 +16,16 @@ import (
 	"github.com/omriharel/deej/pkg/deej/util"
 )
 
+type DeejIO interface {
+	Start() error
+	Stop()
+	SubscribeToSliderMoveEvents() chan SliderMoveEvent
+	setupOnConfigReload()
+	close(logger *zap.SugaredLogger)
+	readLine(logger *zap.SugaredLogger, reader *bufio.Reader) chan string
+	handleLine(logger *zap.SugaredLogger, line string)
+}
+
 // SerialIO provides a deej-aware abstraction layer to managing serial I/O
 type SerialIO struct {
 	comPort  string

@@ -15,7 +15,8 @@ import (
 const (
 
 	// when this is set to anything, deej won't use a tray icon
-	envNoTray = "DEEJ_NO_TRAY_ICON"
+	envNoTray  = "DEEJ_NO_TRAY_ICON"
+	envUseREST = "DEEJ_USE_REST"
 )
 
 // Deej is the main entity managing access to all sub-components
@@ -23,15 +24,16 @@ type Deej struct {
 	logger   *zap.SugaredLogger
 	notifier Notifier
 	config   *CanonicalConfig
-	serial   *SerialIO
+	serial   DeejIO
 	sessions *sessionMap
 
-	stopChannel chan bool
-	version     string
-	verbose     bool
+	stopChannel  chan bool
+	version      string
+	verbose      bool
+	handleSerial bool // Flag to indicate whether to handle a serial connection
 }
 
-// NewDeej creates a Deej instance
+// NewDeej creates a Deej instance with the option to handle a serial connection or start a REST server.
 func NewDeej(logger *zap.SugaredLogger, verbose bool) (*Deej, error) {
 	logger = logger.Named("deej")
 
@@ -48,20 +50,37 @@ func NewDeej(logger *zap.SugaredLogger, verbose bool) (*Deej, error) {
 	}
 
 	d := &Deej{
-		logger:      logger,
-		notifier:    notifier,
-		config:      config,
-		stopChannel: make(chan bool),
-		verbose:     verbose,
+		logger:       logger,
+		notifier:     notifier,
+		config:       config,
+		stopChannel:  make(chan bool),
+		verbose:      verbose,
+		handleSerial: false, // Default to not handling serial connection
 	}
 
-	serial, err := NewSerialIO(d, logger)
-	if err != nil {
-		logger.Errorw("Failed to create SerialIO", "error", err)
-		return nil, fmt.Errorf("create new SerialIO: %w", err)
-	}
+	os.Setenv(envUseREST, "TRUE")
+	if _, useRest := os.LookupEnv(envUseREST); useRest {
+		d.logger.Debugw("Running with REST server and without serial", "reason", "envvar set")
 
-	d.serial = serial
+		serial, err := NewHttpIO(d, logger)
+		if err != nil {
+			logger.Errorw("Failed to create HttpIO", "error", err)
+			return nil, fmt.Errorf("create new HttpIO: %w", err)
+		}
+
+		d.serial = serial
+	} else {
+		d.logger.Debugw("Running with serial", "reason", "envvar not set")
+		d.handleSerial = true // Set to handle serial connection
+
+		serial, err := NewSerialIO(d, logger)
+		if err != nil {
+			logger.Errorw("Failed to create SerialIO", "error", err)
+			return nil, fmt.Errorf("create new SerialIO: %w", err)
+		}
+
+		d.serial = serial
+	}
 
 	sessionFinder, err := newSessionFinder(logger)
 	if err != nil {
@@ -82,7 +101,7 @@ func NewDeej(logger *zap.SugaredLogger, verbose bool) (*Deej, error) {
 	return d, nil
 }
 
-// Initialize sets up components and starts to run in the background
+// Initialize sets up components and starts to run in the background.
 func (d *Deej) Initialize() error {
 	d.logger.Debug("Initializing")
 
@@ -138,6 +157,14 @@ func (d *Deej) setupInterruptHandler() {
 func (d *Deej) run() {
 	d.logger.Info("Run loop starting")
 
+	if d.handleSerial {
+		d.run_serial()
+	} else {
+		d.run_rest()
+	}
+}
+
+func (d *Deej) run_serial() {
 	// watch the config file for changes
 	go d.config.WatchConfigFileChanges()
 
@@ -182,6 +209,31 @@ func (d *Deej) run() {
 	}
 }
 
+func (d *Deej) run_rest() {
+	// watch the config file for changes
+	go d.config.WatchConfigFileChanges()
+
+	// connect to the arduino for the first time
+	go func() {
+		if err := d.serial.Start(); err != nil {
+			d.logger.Errorw("Failed to start Http server", "error", err)
+			d.signalStop()
+		}
+	}()
+
+	// wait until stopped (gracefully)
+	<-d.stopChannel
+	d.logger.Debug("Stop channel signaled, terminating")
+
+	if err := d.stop(); err != nil {
+		d.logger.Warnw("Failed to stop deej", "error", err)
+		os.Exit(1)
+	} else {
+		// exit with 0
+		os.Exit(0)
+	}
+}
+
 func (d *Deej) signalStop() {
 	d.logger.Debug("Signalling stop channel")
 	d.stopChannel <- true
@@ -190,7 +242,9 @@ func (d *Deej) signalStop() {
 func (d *Deej) stop() error {
 	d.logger.Info("Stopping")
 
-	d.config.StopWatchingConfigFile()
+	if d.handleSerial {
+		d.config.StopWatchingConfigFile()
+	}
 	d.serial.Stop()
 
 	// release the session map
